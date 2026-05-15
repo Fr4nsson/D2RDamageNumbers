@@ -1,0 +1,49 @@
+# Visual Studio user/local files
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+.vs/
+
+# Build output directories
+x64/
+x86/
+Win32/
+Debug/
+Release/
+D2RDamageNumbers/x64/
+D2RDamageNumbers/x86/
+D2RDamageNumbers/Win32/
+D2RDamageNumbers/Debug/
+D2RDamageNumbers/Release/
+
+# C/C++ build artifacts
+*.obj
+*.pdb
+*.ilk
+*.ipdb
+*.iobj
+*.idb
+*.exp
+*.lib
+*.lastbuildstate
+*.tlog
+*.recipe
+*.res
+
+# Packaged binaries and generated archives
+*.exe
+*.dll
+*.zip
+*.7z
+*.rar
+
+# Runtime logs and diagnostics
+*.log
+D2RDamageNumbers.log
+
+# OS/editor noise
+Thumbs.db
+Desktop.ini
+*.tmp
+*.bak
