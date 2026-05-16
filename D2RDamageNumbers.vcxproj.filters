@@ -90,7 +90,6 @@
     </ResourceCompile>
   </ItemGroup>
   <ItemGroup>
-    <None Include="D2RDamageNumbers.ini" />
     <None Include="diablo4.ttf" />
     <None Include="OFL.txt" />
   </ItemGroup>

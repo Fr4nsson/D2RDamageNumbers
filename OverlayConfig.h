@@ -102,6 +102,7 @@ std::wstring GetConfigDirectory();
 std::wstring GetLogPath();
 std::wstring ResolveConfigRelativePath(const std::wstring& path);
 
+bool EnsureDefaultConfigFileExists();
 void LoadOverlayConfig(OverlayConfig& config);
 bool WriteConfigBool(const wchar_t* section, const wchar_t* key, bool value);
 bool WriteConfigFloat(const wchar_t* section, const wchar_t* key, float value);

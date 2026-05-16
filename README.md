@@ -34,7 +34,7 @@ Build `D2RDamageNumbers.sln` as `x64 Release`, then run:
 x64\Release\D2RDamageNumbers.exe
 ```
 
-Keep `D2RDamageNumbers.ini` and `diablo4.ttf` next to the executable. The app loads the INI from the executable directory, so the normal runtime config is:
+Keep `diablo4.ttf` next to the executable. The app loads its runtime INI from the executable directory, creating a commented default file there if it is missing, so the normal runtime config is:
 
 ```text
 x64\Release\D2RDamageNumbers.ini
@@ -42,7 +42,7 @@ x64\Release\D2RDamageNumbers.ini
 
 After editing the INI, use the tray menu's `Reload Config` command. You do not need to restart Diablo II: Resurrected or restart this overlay; config changes take effect immediately after reload.
 
-Position learning note: the overlay may require you to hover over roughly 3-7 monsters before damage numbers position correctly. This gives the world-position projection enough samples for your current camera/resolution.
+Position learning note: the overlay may require you to hover over roughly 3-7 monsters the first time before damage numbers position correctly. Once learned, the world-position projection is saved under `[ProjectionCalibration]` and reused on later launches when the game window size matches.
 
 Startup note: the overlay only starts when D2R is already running, prevents duplicate overlay instances, and closes automatically when the watched D2R process exits. It records the last D2R.exe SHA-256 that passed startup offset validation under `[Compatibility] D2RExeSha256`; if the hash changes on a later launch, it warns that the memory offsets may need updating but still lets you continue.
 
@@ -149,8 +149,8 @@ Hotkeys can be function keys like `F8`, hex virtual-key values like `0x70`, or a
 | `ScreenAnchorMaxCursorDistance` | Maximum cursor distance allowed for a candidate sample. |
 | `ScreenAnchorMaxAverageError` | Maximum average error for a screen-anchor model. |
 | `ScreenAnchorMinMovementSpan` | Minimum movement span before a screen-anchor model is accepted. |
-| `LearnWorldProjection` | Learns projection from hover samples for the current camera/resolution. |
-| `WorldProjectionMinSamples` | Minimum samples before learned projection can be used. |
+| `LearnWorldProjection` | `1` learns projection samples from monster hovers and saves calibration at stable milestones. `0` still uses saved `[ProjectionCalibration]` values as read-only when they match the current window size. |
+| `WorldProjectionMinSamples` | Minimum samples before a new projection can be used when no saved calibration is active. |
 | `WorldCoordMinDistinctUnits` | Minimum distinct units needed for world-coordinate candidate learning. |
 | `WorldCoordMaxRmsError` | Maximum RMS error for a world-coordinate model. |
 | `WorldCoordMinMovementSpan` | Minimum movement span before accepting a world-coordinate model. |
@@ -160,6 +160,10 @@ Hotkeys can be function keys like `F8`, hex virtual-key values like `0x70`, or a
 | `PositionProbeHotkey` | Writes a position probe while hovering an enemy. |
 | `HitRecorder` | Enables rolling memory snapshots around real hits. |
 | `MarkerHotkey` | Writes a marker around the latest hit for research. |
+
+### Projection Calibration
+
+`[ProjectionCalibration]` is managed by the overlay. It stores the learned world-projection coefficients, RMS error, sample count, and the game-window size they were learned against. A restored calibration stays active until the new session has enough fresh samples to replace it safely. Delete that section to force learning to start fresh.
 
 ### Debug
 

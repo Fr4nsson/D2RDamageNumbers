@@ -156,9 +156,6 @@
     <ResourceCompile Include="D2RDamageNumbers.rc" />
   </ItemGroup>
   <ItemGroup>
-    <None Include="D2RDamageNumbers.ini">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-    </None>
     <None Include="diablo4.ttf">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>

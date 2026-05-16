@@ -298,6 +298,7 @@ static bool TryComputeFileSha256(const std::wstring& path, std::wstring& sha256)
 }
 
 static std::wstring ReadStoredD2RHash() {
+    EnsureDefaultConfigFileExists();
     wchar_t value[128]{};
     const std::wstring configPath = GetConfigPath();
     GetPrivateProfileStringW(
@@ -313,6 +314,7 @@ static std::wstring ReadStoredD2RHash() {
 }
 
 static void WriteStoredD2RHash(const std::wstring& hash) {
+    EnsureDefaultConfigFileExists();
     const std::wstring configPath = GetConfigPath();
     WritePrivateProfileStringW(L"Compatibility", L"D2RExeSha256", hash.c_str(), configPath.c_str());
     WritePrivateProfileStringW(nullptr, nullptr, nullptr, configPath.c_str());
@@ -434,7 +436,8 @@ static bool ValidateOffsetsForLaunch(DWORD processId) {
 
     std::wstring message =
         L"D2R Damage Numbers could not find the required D2R memory offsets and will close.\n\n"
-        L"This usually means Diablo II: Resurrected updated and the memory signatures need maintenance.";
+        L"One possible reason is that Diablo II: Resurrected is paused.\n\n"
+        L"If the game is not paused, this usually means Diablo II: Resurrected updated and the memory signatures need maintenance.";
 
     if (!status.empty()) {
         message += L"\n\nScanner status:\n";
@@ -851,7 +854,10 @@ static std::wstring BuildDebugStatusText() {
     status += L"\nWorld pos: ";
     status += g_config.useWorldPositions ? L"on" : L"off";
     status += g_config.followDamageTargets ? L" follow" : L" static";
-    if (g_config.learnWorldProjection && g_worldProjectionModel.ready) {
+    if (!g_config.learnWorldProjection) {
+        status += L" readonly";
+    }
+    if (g_worldProjectionModel.ready) {
         status += L" learned samples=";
         status += std::to_wstring(g_worldProjectionModel.sampleCount);
         status += L" err=";

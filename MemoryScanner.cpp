@@ -39,6 +39,18 @@ std::wstring g_lastLoggedScreenAnchorLabel;
 size_t g_worldCoordScreenOffsetCalibrationSamples = 0;
 std::wstring g_lastLoggedWorldCoordLabel;
 uint64_t g_nextHitRecorderSampleId = 1;
+constexpr wchar_t kProjectionCalibrationSection[] = L"ProjectionCalibration";
+constexpr int kProjectionCalibrationVersion = 1;
+constexpr size_t kWorldProjectionMaxSamples = 80;
+constexpr size_t kWorldProjectionPersistMinSamples = 40;
+bool g_worldProjectionPersistenceChecked = false;
+int g_worldProjectionPersistenceCheckedWidth = 0;
+int g_worldProjectionPersistenceCheckedHeight = 0;
+bool g_worldProjectionModelLoadedFromDisk = false;
+int g_worldProjectionActiveViewportWidth = 0;
+int g_worldProjectionActiveViewportHeight = 0;
+size_t g_worldProjectionLastPersistedSampleCount = 0;
+bool g_worldProjectionPersistedFullModel = false;
 
 OverlayConfig& ActiveConfig() {
     return g_frameContext.config ? *g_frameContext.config : g_fallbackConfig;
@@ -76,6 +88,279 @@ std::wstring ScannerBuildMemoryLogText() {
     return g_callbacks.buildMemoryLogText ? g_callbacks.buildMemoryLogText() : std::wstring();
 }
 
+bool TryGetWorldProjectionViewportSize(int& width, int& height) {
+    width = 0;
+    height = 0;
+    if (!g_frameContext.hasGameRect) return false;
+
+    width = g_frameContext.gameRect.right - g_frameContext.gameRect.left;
+    height = g_frameContext.gameRect.bottom - g_frameContext.gameRect.top;
+    return width > 0 && height > 0;
+}
+
+bool ReadProfileFloat(
+    const std::wstring& configPath,
+    const wchar_t* section,
+    const wchar_t* key,
+    float& value
+) {
+    wchar_t text[64]{};
+    GetPrivateProfileStringW(section, key, L"", text, 64, configPath.c_str());
+    if (text[0] == L'\0') return false;
+
+    wchar_t* end = nullptr;
+    const float parsed = wcstof(text, &end);
+    if (end == text || !std::isfinite(parsed)) return false;
+
+    value = parsed;
+    return true;
+}
+
+bool ReadProfileInt(
+    const std::wstring& configPath,
+    const wchar_t* section,
+    const wchar_t* key,
+    int& value
+) {
+    wchar_t text[64]{};
+    GetPrivateProfileStringW(section, key, L"", text, 64, configPath.c_str());
+    if (text[0] == L'\0') return false;
+
+    wchar_t* end = nullptr;
+    const long parsed = wcstol(text, &end, 10);
+    if (end == text || *end != L'\0' || parsed < INT_MIN || parsed > INT_MAX) return false;
+
+    value = static_cast<int>(parsed);
+    return true;
+}
+
+bool WriteProfileFloat(
+    const std::wstring& configPath,
+    const wchar_t* section,
+    const wchar_t* key,
+    float value
+) {
+    wchar_t text[64]{};
+    swprintf_s(text, L"%.6f", static_cast<double>(value));
+    return WritePrivateProfileStringW(section, key, text, configPath.c_str()) != FALSE;
+}
+
+bool WriteProfileInt(
+    const std::wstring& configPath,
+    const wchar_t* section,
+    const wchar_t* key,
+    int value
+) {
+    wchar_t text[32]{};
+    swprintf_s(text, L"%d", value);
+    return WritePrivateProfileStringW(section, key, text, configPath.c_str()) != FALSE;
+}
+
+bool IsWorldProjectionModelUsable(const WorldProjectionModel& model) {
+    return model.ready &&
+        std::isfinite(model.ax) &&
+        std::isfinite(model.bx) &&
+        std::isfinite(model.cx) &&
+        std::isfinite(model.ay) &&
+        std::isfinite(model.by) &&
+        std::isfinite(model.cy) &&
+        std::isfinite(model.rmsError) &&
+        model.rmsError >= 0.0f &&
+        model.sampleCount >= static_cast<size_t>(max(3, ActiveConfig().worldProjectionMinSamples));
+}
+
+size_t ConfiguredWorldProjectionMinSamples() {
+    return static_cast<size_t>(max(3, ActiveConfig().worldProjectionMinSamples));
+}
+
+size_t WorldProjectionPersistSampleCount() {
+    size_t required = ConfiguredWorldProjectionMinSamples();
+    if (required < kWorldProjectionPersistMinSamples) {
+        required = kWorldProjectionPersistMinSamples;
+    }
+    return required;
+}
+
+size_t WorldProjectionReplacementSampleCount() {
+    size_t required = ConfiguredWorldProjectionMinSamples();
+    if (!g_worldProjectionModelLoadedFromDisk || !g_worldProjectionModel.ready) {
+        return required;
+    }
+
+    if (required < kWorldProjectionPersistMinSamples) {
+        required = kWorldProjectionPersistMinSamples;
+    }
+
+    size_t restoredSamples = g_worldProjectionModel.sampleCount;
+    if (restoredSamples > kWorldProjectionMaxSamples) {
+        restoredSamples = kWorldProjectionMaxSamples;
+    }
+    if (required < restoredSamples) {
+        required = restoredSamples;
+    }
+
+    return required;
+}
+
+void MarkWorldProjectionFitUnavailable() {
+    if (!g_worldProjectionModelLoadedFromDisk) {
+        g_worldProjectionModel.ready = false;
+    }
+}
+
+void ResetWorldProjectionLearning() {
+    g_worldProjectionCalibrated = false;
+    g_worldProjectionBiasX = 0.0f;
+    g_worldProjectionBiasY = 0.0f;
+    g_worldProjectionSamples.clear();
+    g_worldProjectionModel = WorldProjectionModel{};
+    g_worldProjectionModelLoadedFromDisk = false;
+    g_worldProjectionLastPersistedSampleCount = 0;
+    g_worldProjectionPersistedFullModel = false;
+}
+
+bool ShouldPersistWorldProjectionModel(const WorldProjectionModel& model, bool force) {
+    if (model.sampleCount < WorldProjectionPersistSampleCount()) return false;
+    if (force) return true;
+    if (g_worldProjectionLastPersistedSampleCount == 0) return true;
+    if (model.sampleCount >= kWorldProjectionMaxSamples && !g_worldProjectionPersistedFullModel) return true;
+    return false;
+}
+
+bool TryReadPersistedWorldProjectionModel(
+    int width,
+    int height,
+    WorldProjectionModel& model,
+    int& savedWidth,
+    int& savedHeight
+) {
+    model = WorldProjectionModel{};
+    savedWidth = 0;
+    savedHeight = 0;
+
+    EnsureDefaultConfigFileExists();
+    const std::wstring configPath = GetConfigPath();
+    const int version = GetPrivateProfileIntW(
+        kProjectionCalibrationSection,
+        L"Version",
+        0,
+        configPath.c_str()
+    );
+    if (version != kProjectionCalibrationVersion) return false;
+
+    if (!ReadProfileInt(configPath, kProjectionCalibrationSection, L"ViewportWidth", savedWidth) ||
+        !ReadProfileInt(configPath, kProjectionCalibrationSection, L"ViewportHeight", savedHeight) ||
+        savedWidth != width ||
+        savedHeight != height) {
+        return false;
+    }
+
+    int sampleCount = 0;
+    model.ready = true;
+    if (!ReadProfileFloat(configPath, kProjectionCalibrationSection, L"Ax", model.ax) ||
+        !ReadProfileFloat(configPath, kProjectionCalibrationSection, L"Bx", model.bx) ||
+        !ReadProfileFloat(configPath, kProjectionCalibrationSection, L"Cx", model.cx) ||
+        !ReadProfileFloat(configPath, kProjectionCalibrationSection, L"Ay", model.ay) ||
+        !ReadProfileFloat(configPath, kProjectionCalibrationSection, L"By", model.by) ||
+        !ReadProfileFloat(configPath, kProjectionCalibrationSection, L"Cy", model.cy) ||
+        !ReadProfileFloat(configPath, kProjectionCalibrationSection, L"RmsError", model.rmsError) ||
+        !ReadProfileInt(configPath, kProjectionCalibrationSection, L"SampleCount", sampleCount) ||
+        sampleCount < 0) {
+        return false;
+    }
+
+    model.sampleCount = static_cast<size_t>(sampleCount);
+    return IsWorldProjectionModelUsable(model);
+}
+
+void PersistWorldProjectionModel(const WorldProjectionModel& model, bool force = false) {
+    if (!IsWorldProjectionModelUsable(model)) return;
+    if (!ShouldPersistWorldProjectionModel(model, force)) return;
+
+    int width = 0;
+    int height = 0;
+    if (!TryGetWorldProjectionViewportSize(width, height)) return;
+
+    EnsureDefaultConfigFileExists();
+    const std::wstring configPath = GetConfigPath();
+    bool saved = true;
+    saved = WriteProfileInt(configPath, kProjectionCalibrationSection, L"Version", kProjectionCalibrationVersion) && saved;
+    saved = WriteProfileInt(configPath, kProjectionCalibrationSection, L"ViewportWidth", width) && saved;
+    saved = WriteProfileInt(configPath, kProjectionCalibrationSection, L"ViewportHeight", height) && saved;
+    saved = WriteProfileFloat(configPath, kProjectionCalibrationSection, L"Ax", model.ax) && saved;
+    saved = WriteProfileFloat(configPath, kProjectionCalibrationSection, L"Bx", model.bx) && saved;
+    saved = WriteProfileFloat(configPath, kProjectionCalibrationSection, L"Cx", model.cx) && saved;
+    saved = WriteProfileFloat(configPath, kProjectionCalibrationSection, L"Ay", model.ay) && saved;
+    saved = WriteProfileFloat(configPath, kProjectionCalibrationSection, L"By", model.by) && saved;
+    saved = WriteProfileFloat(configPath, kProjectionCalibrationSection, L"Cy", model.cy) && saved;
+    saved = WriteProfileFloat(configPath, kProjectionCalibrationSection, L"RmsError", model.rmsError) && saved;
+    const int sampleCount = model.sampleCount > static_cast<size_t>(INT_MAX)
+        ? INT_MAX
+        : static_cast<int>(model.sampleCount);
+    saved = WriteProfileInt(configPath, kProjectionCalibrationSection, L"SampleCount", sampleCount) && saved;
+    WritePrivateProfileStringW(nullptr, nullptr, nullptr, configPath.c_str());
+
+    if (saved) {
+        g_worldProjectionPersistenceChecked = true;
+        g_worldProjectionPersistenceCheckedWidth = width;
+        g_worldProjectionPersistenceCheckedHeight = height;
+        g_worldProjectionLastPersistedSampleCount = model.sampleCount;
+        g_worldProjectionPersistedFullModel = model.sampleCount >= kWorldProjectionMaxSamples;
+    }
+}
+
+void MaybeLoadPersistedWorldProjectionModel() {
+    int width = 0;
+    int height = 0;
+    if (!TryGetWorldProjectionViewportSize(width, height)) return;
+
+    if ((g_worldProjectionActiveViewportWidth != 0 || g_worldProjectionActiveViewportHeight != 0) &&
+        (g_worldProjectionActiveViewportWidth != width || g_worldProjectionActiveViewportHeight != height)) {
+        ResetWorldProjectionLearning();
+        g_worldProjectionPersistenceChecked = false;
+    }
+    g_worldProjectionActiveViewportWidth = width;
+    g_worldProjectionActiveViewportHeight = height;
+
+    if (g_worldProjectionModel.ready && !IsWorldProjectionModelUsable(g_worldProjectionModel)) {
+        g_worldProjectionModel = WorldProjectionModel{};
+        g_worldProjectionModelLoadedFromDisk = false;
+        g_worldProjectionPersistenceChecked = false;
+    }
+
+    if (g_worldProjectionPersistenceChecked &&
+        g_worldProjectionPersistenceCheckedWidth == width &&
+        g_worldProjectionPersistenceCheckedHeight == height) {
+        return;
+    }
+
+    g_worldProjectionPersistenceChecked = true;
+    g_worldProjectionPersistenceCheckedWidth = width;
+    g_worldProjectionPersistenceCheckedHeight = height;
+
+    WorldProjectionModel model{};
+    int savedWidth = 0;
+    int savedHeight = 0;
+    if (!TryReadPersistedWorldProjectionModel(width, height, model, savedWidth, savedHeight)) {
+        return;
+    }
+
+    g_worldProjectionModel = model;
+    g_worldProjectionModelLoadedFromDisk = true;
+    g_worldProjectionLastPersistedSampleCount = model.sampleCount;
+    g_worldProjectionPersistedFullModel = model.sampleCount >= kWorldProjectionMaxSamples;
+
+    std::wstring text = L"World projection restored: samples=";
+    text += std::to_wstring(g_worldProjectionModel.sampleCount);
+    text += L" rms=";
+    text += std::to_wstring(static_cast<int>(g_worldProjectionModel.rmsError));
+    text += L" size=";
+    text += std::to_wstring(savedWidth);
+    text += L"x";
+    text += std::to_wstring(savedHeight);
+    ScannerAppendLogBlock(text);
+}
+
 }
 
 #define g_config (ActiveConfig())
@@ -111,11 +396,10 @@ static void CloseMemorySource() {
     }
 
     g_memorySource = MemorySource{};
-    g_worldProjectionCalibrated = false;
-    g_worldProjectionBiasX = 0.0f;
-    g_worldProjectionBiasY = 0.0f;
-    g_worldProjectionSamples.clear();
-    g_worldProjectionModel = WorldProjectionModel{};
+    ResetWorldProjectionLearning();
+    g_worldProjectionActiveViewportWidth = 0;
+    g_worldProjectionActiveViewportHeight = 0;
+    g_worldProjectionPersistenceChecked = false;
     g_screenAnchorCandidates.clear();
     g_screenAnchorModel = ScreenAnchorModel{};
     g_screenAnchorHoverSamples = 0;
@@ -2913,8 +3197,8 @@ static bool SolveProjectionAxis(
 }
 
 static bool FitWorldProjectionModel() {
-    if (g_worldProjectionSamples.size() < static_cast<size_t>(max(3, g_config.worldProjectionMinSamples))) {
-        g_worldProjectionModel.ready = false;
+    if (g_worldProjectionSamples.size() < WorldProjectionReplacementSampleCount()) {
+        MarkWorldProjectionFitUnavailable();
         return false;
     }
 
@@ -2930,14 +3214,14 @@ static bool FitWorldProjectionModel() {
     }
 
     if ((maxDx - minDx) + (maxDy - minDy) < 2.0f) {
-        g_worldProjectionModel.ready = false;
+        MarkWorldProjectionFitUnavailable();
         return false;
     }
 
     WorldProjectionModel model{};
     if (!SolveProjectionAxis(g_worldProjectionSamples, true, model.ax, model.bx, model.cx) ||
         !SolveProjectionAxis(g_worldProjectionSamples, false, model.ay, model.by, model.cy)) {
-        g_worldProjectionModel.ready = false;
+        MarkWorldProjectionFitUnavailable();
         return false;
     }
 
@@ -2954,7 +3238,10 @@ static bool FitWorldProjectionModel() {
     model.sampleCount = g_worldProjectionSamples.size();
     const size_t denominator = g_worldProjectionSamples.empty() ? 1 : g_worldProjectionSamples.size();
     model.rmsError = static_cast<float>(std::sqrt(squaredError / static_cast<double>(denominator)));
+    const bool replacedRestoredModel = g_worldProjectionModelLoadedFromDisk;
     g_worldProjectionModel = model;
+    g_worldProjectionModelLoadedFromDisk = false;
+    PersistWorldProjectionModel(g_worldProjectionModel, replacedRestoredModel);
     return true;
 }
 
@@ -2987,9 +3274,11 @@ static void AddWorldProjectionSample(float dx, float dy, float screenX, float sc
     }
 
     g_worldProjectionSamples.push_back(sample);
-    constexpr size_t maxSamples = 80;
-    if (g_worldProjectionSamples.size() > maxSamples) {
-        g_worldProjectionSamples.erase(g_worldProjectionSamples.begin(), g_worldProjectionSamples.begin() + (g_worldProjectionSamples.size() - maxSamples));
+    if (g_worldProjectionSamples.size() > kWorldProjectionMaxSamples) {
+        g_worldProjectionSamples.erase(
+            g_worldProjectionSamples.begin(),
+            g_worldProjectionSamples.begin() + (g_worldProjectionSamples.size() - kWorldProjectionMaxSamples)
+        );
     }
 
     FitWorldProjectionModel();
@@ -3011,7 +3300,7 @@ static bool ProjectWorldPositionRelativeToPlayer(
     const float dx = targetPosition.x - playerPosition.x;
     const float dy = targetPosition.y - playerPosition.y;
 
-    if (useCalibration && g_config.learnWorldProjection && g_worldProjectionModel.ready) {
+    if (useCalibration && g_worldProjectionModel.ready) {
         screenX = (g_worldProjectionModel.ax * dx) + (g_worldProjectionModel.bx * dy) + g_worldProjectionModel.cx;
         screenY = (g_worldProjectionModel.ay * dx) + (g_worldProjectionModel.by * dy) + g_worldProjectionModel.cy;
     }
@@ -4758,6 +5047,7 @@ static bool TryProjectUnitToScreen(
 
 static void UpdateWorldProjectionCalibration() {
     if (!g_config.useWorldPositions ||
+        !g_config.learnWorldProjection ||
         !g_memorySource.hoverReady ||
         !g_memorySource.hover.isHovered ||
         g_memorySource.hover.hoveredUnitType != D2_UNIT_MONSTER) {
@@ -6061,6 +6351,7 @@ void ConfigureMemoryScannerCallbacks(const MemoryScannerCallbacks& callbacks) {
 
 void SetMemoryScannerFrameContext(const MemoryScannerFrameContext& context) {
     g_frameContext = context;
+    MaybeLoadPersistedWorldProjectionModel();
 }
 
 bool FindD2RProcess(D2RProcessInfo& processInfo) {
