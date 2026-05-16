@@ -17,6 +17,7 @@ Compatibility note: this has only been tested in single player with the Steam ve
 - Optional test mode with hotkeys for synthetic damage numbers.
 - Tray menu for common toggles, config reload, log opening, and test burst spawning.
 - Debug tools for position candidate research and hit-recorder snapshots.
+- Startup safety checks for duplicate launches, missing D2R, changed D2R.exe hashes, and unresolved memory offsets.
 
 ## Requirements
 
@@ -42,6 +43,8 @@ x64\Release\D2RDamageNumbers.ini
 After editing the INI, use the tray menu's `Reload Config` command. You do not need to restart Diablo II: Resurrected or restart this overlay; config changes take effect immediately after reload.
 
 Position learning note: the overlay may require you to hover over roughly 3-7 monsters before damage numbers position correctly. This gives the world-position projection enough samples for your current camera/resolution.
+
+Startup note: the overlay only starts when D2R is already running, prevents duplicate overlay instances, and closes automatically when the watched D2R process exits. It records the last D2R.exe SHA-256 that passed startup offset validation under `[Compatibility] D2RExeSha256`; if the hash changes on a later launch, it warns that the memory offsets may need updating but still lets you continue.
 
 ## Tray Menu
 

@@ -313,6 +313,29 @@ static bool FindD2RProcessId(DWORD& processId) {
     return found;
 }
 
+static bool QueryProcessImagePath(HANDLE process, std::wstring& processPath) {
+    processPath.clear();
+    if (!process) return false;
+
+    std::vector<wchar_t> buffer(32768);
+    DWORD size = static_cast<DWORD>(buffer.size());
+    if (QueryFullProcessImageNameW(process, 0, buffer.data(), &size) == FALSE || size == 0) {
+        return false;
+    }
+
+    processPath.assign(buffer.data(), size);
+    return true;
+}
+
+static bool QueryProcessImagePath(DWORD processId, std::wstring& processPath) {
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId);
+    if (!process) return false;
+
+    const bool found = QueryProcessImagePath(process, processPath);
+    CloseHandle(process);
+    return found;
+}
+
 static bool AttachMemorySourceProcess(DWORD processId) {
     if (processId == 0) {
         CloseMemorySource();
@@ -332,9 +355,8 @@ static bool AttachMemorySourceProcess(DWORD processId) {
         return false;
     }
 
-    wchar_t processPath[MAX_PATH]{};
-    DWORD processPathSize = ARRAYSIZE(processPath);
-    QueryFullProcessImageNameW(process, 0, processPath, &processPathSize);
+    std::wstring processPath;
+    QueryProcessImagePath(process, processPath);
 
     uintptr_t moduleBase = 0;
     DWORD moduleSize = 0;
@@ -599,6 +621,14 @@ static uintptr_t GetServerUnitTableBaseForValidation(uintptr_t currentGame, uint
     }
 }
 
+static bool IsInsideRemoteMainModule(uintptr_t address) {
+    if (g_memorySource.moduleBase == 0 || g_memorySource.moduleSize == 0) return false;
+
+    const uintptr_t moduleStart = g_memorySource.moduleBase;
+    const uintptr_t moduleEnd = moduleStart + static_cast<uintptr_t>(g_memorySource.moduleSize);
+    return address >= moduleStart && address < moduleEnd;
+}
+
 static size_t CountLikelyServerUnitsForValidation(
     uintptr_t tableBase,
     int bucketCount,
@@ -648,6 +678,7 @@ static int ScoreCurrentGamePointerForValidation(
     if (objectCount) *objectCount = 0;
 
     if (!IsLikelyRemotePointer(currentGame)) return 0;
+    if (IsInsideRemoteMainModule(currentGame)) return 0;
 
     const size_t players = CountLikelyServerUnitsForValidation(
         GetServerUnitTableBaseForValidation(currentGame, 0),
@@ -1013,7 +1044,7 @@ static bool InitializeMemoryPatterns() {
         g_memorySource.unitHashPatternName
     );
 
-    if (!foundMouseHover || !foundUnitHashTable) {
+    if (!foundMouseHover || !foundCurrentGame || !foundUnitHashTable) {
         g_memorySource.status = L"patterns not found ";
         g_memorySource.status += BuildPatternMissStatus(L"hover", g_memorySource.mouseHoverPatternMatches, g_memorySource.mouseHoverPatternName);
         g_memorySource.status += L" ";
@@ -1024,10 +1055,10 @@ static bool InitializeMemoryPatterns() {
     }
 
     g_memorySource.mouseHoverAddress = mouseHoverAddress;
-    g_memorySource.currentSinglePlayerGameAddress = foundCurrentGame ? currentGameAddress : 0;
+    g_memorySource.currentSinglePlayerGameAddress = currentGameAddress;
     g_memorySource.unitHashTableAddress = unitHashTableAddress;
     g_memorySource.patternsReady = true;
-    g_memorySource.status = foundCurrentGame ? L"patterns ready" : L"hover pattern ready; game pattern missing";
+    g_memorySource.status = L"patterns ready";
     return true;
 }
 
@@ -6030,6 +6061,45 @@ void ConfigureMemoryScannerCallbacks(const MemoryScannerCallbacks& callbacks) {
 
 void SetMemoryScannerFrameContext(const MemoryScannerFrameContext& context) {
     g_frameContext = context;
+}
+
+bool FindD2RProcess(D2RProcessInfo& processInfo) {
+    processInfo = D2RProcessInfo{};
+
+    DWORD processId = 0;
+    if (!FindD2RProcessId(processId)) {
+        return false;
+    }
+
+    processInfo.processId = processId;
+    QueryProcessImagePath(processId, processInfo.processPath);
+    return true;
+}
+
+bool ValidateD2RMemoryOffsets(DWORD processId, std::wstring& status) {
+    status.clear();
+
+    if (!AttachMemorySourceProcess(processId)) {
+        status = g_memorySource.status;
+        CloseMemorySourceCore();
+        return false;
+    }
+
+    const bool ready = InitializeMemoryPatterns();
+    status = g_memorySource.status;
+
+    if (!ready && !g_memorySource.patternDiagnostics.empty()) {
+        status += L"\n";
+        status += g_memorySource.patternDiagnostics;
+    }
+
+    if (!ready && !g_memorySource.currentGameCandidateDiagnostics.empty()) {
+        status += L"\n";
+        status += g_memorySource.currentGameCandidateDiagnostics;
+    }
+
+    CloseMemorySourceCore();
+    return ready;
 }
 
 void PollMemorySource(const MemoryScannerFrameContext& context, float dt) {

@@ -315,6 +315,11 @@ struct MemoryScannerFrameContext {
     OverlayConfig* config = nullptr;
 };
 
+struct D2RProcessInfo {
+    DWORD processId = 0;
+    std::wstring processPath;
+};
+
 extern MemorySource g_memorySource;
 extern std::vector<PositionDebugMarker> g_positionDebugMarkers;
 extern bool g_worldProjectionCalibrated;
@@ -332,6 +337,8 @@ extern HitRecorderDamage g_lastHitRecorderDamage;
 
 void ConfigureMemoryScannerCallbacks(const MemoryScannerCallbacks& callbacks);
 void SetMemoryScannerFrameContext(const MemoryScannerFrameContext& context);
+bool FindD2RProcess(D2RProcessInfo& processInfo);
+bool ValidateD2RMemoryOffsets(DWORD processId, std::wstring& status);
 void PollMemorySource(const MemoryScannerFrameContext& context, float dt);
 void CloseMemorySource();
 int RunMemoryScanOnce(HWND gameWnd, OverlayConfig& config);

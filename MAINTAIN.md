@@ -24,8 +24,7 @@ This file is for maintainers who need to repair the overlay after a Diablo II: R
 
 5. Check the debug overlay or `D2RDamageNumbers.log` for:
 
-   - `patterns not found`: update signatures in `MemoryScanner.cpp`.
-   - `hover pattern ready; game pattern missing`: current-game signature changed.
+   - `patterns not found`: update signatures in `MemoryScanner.cpp`. The overlay requires the hover, current-game, and unit-hash patterns before it starts.
    - D2R found but memory disconnected: process/module discovery or access changed.
    - Patterns ready but HP missing/wrong: unit/stat offsets likely changed.
    - Damage appears but anchors are wrong: path/world coordinate offsets or projection tuning changed.

@@ -1,4 +1,5 @@
 ﻿#include <windows.h>
+#include <bcrypt.h>
 #include <dwmapi.h>
 #include <shellapi.h>
 #include <tlhelp32.h>
@@ -10,6 +11,7 @@
 #include <algorithm>
 #include <cmath>
 #include <climits>
+#include <cwctype>
 #include <cwchar>
 #include <cstdlib>
 #include <cstring>
@@ -28,9 +30,12 @@
 
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "psapi.lib")
+#pragma comment(lib, "bcrypt.lib")
 
 static HWND g_overlayWnd = nullptr;
 static HWND g_gameWnd = nullptr;
+static HANDLE g_singleInstanceMutex = nullptr;
+static HANDLE g_d2rProcessWatch = nullptr;
 static RECT g_gameRect{};
 static bool g_hasGameRect = false;
 static OverlayConfig g_config;
@@ -53,6 +58,13 @@ static std::wstring BuildDebugStatusText();
 static void LoadConfig();
 static void RestartFrameTimer(HWND hwnd);
 static void QueueTestBurstAtGameCenter();
+static bool AcquireSingleInstanceLock();
+static void ReleaseSingleInstanceLock();
+static bool StartWatchingD2RProcess(DWORD processId);
+static void StopWatchingD2RProcess();
+static bool CloseIfWatchedD2RProcessExited();
+static void CheckD2RHashForLaunch(const std::wstring& processPath, std::wstring& currentHash);
+static bool ValidateOffsetsForLaunch(DWORD processId);
 
 static int ClampInt(int value, int minValue, int maxValue) {
     return max(minValue, min(maxValue, value));
@@ -111,6 +123,326 @@ static std::wstring FormatLogTimestamp() {
     );
 
     return text;
+}
+
+static const wchar_t* kAppTitle = L"D2R Damage Numbers";
+static const wchar_t* kSingleInstanceMutexName =
+    L"Local\\D2RDamageNumbersOverlay_{8B923F41-9024-4320-B662-EEB566401CBF}";
+
+static std::wstring BytesToHexString(const std::vector<unsigned char>& bytes) {
+    static const wchar_t* digits = L"0123456789ABCDEF";
+
+    std::wstring text;
+    text.reserve(bytes.size() * 2);
+    for (unsigned char byte : bytes) {
+        text.push_back(digits[(byte >> 4) & 0x0f]);
+        text.push_back(digits[byte & 0x0f]);
+    }
+
+    return text;
+}
+
+static std::wstring NormalizeHashText(const std::wstring& text) {
+    std::wstring normalized;
+    normalized.reserve(text.size());
+
+    for (wchar_t ch : text) {
+        if (iswspace(ch)) continue;
+        normalized.push_back(static_cast<wchar_t>(towupper(ch)));
+    }
+
+    return normalized;
+}
+
+static bool IsSha256HexString(const std::wstring& text) {
+    if (text.size() != 64) return false;
+
+    for (wchar_t ch : text) {
+        const bool isHex =
+            (ch >= L'0' && ch <= L'9') ||
+            (ch >= L'A' && ch <= L'F') ||
+            (ch >= L'a' && ch <= L'f');
+        if (!isHex) return false;
+    }
+
+    return true;
+}
+
+static bool TryComputeFileSha256(const std::wstring& path, std::wstring& sha256) {
+    sha256.clear();
+    if (path.empty()) return false;
+
+    HANDLE file = CreateFileW(
+        path.c_str(),
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+        nullptr
+    );
+
+    if (file == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+
+    BCRYPT_ALG_HANDLE algorithm = nullptr;
+    BCRYPT_HASH_HANDLE hash = nullptr;
+    std::vector<unsigned char> hashObject;
+    std::vector<unsigned char> digest;
+    bool success = false;
+
+    do {
+        if (!BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(
+            &algorithm,
+            BCRYPT_SHA256_ALGORITHM,
+            nullptr,
+            0
+        ))) {
+            break;
+        }
+
+        DWORD bytesReturned = 0;
+        DWORD objectLength = 0;
+        if (!BCRYPT_SUCCESS(BCryptGetProperty(
+            algorithm,
+            BCRYPT_OBJECT_LENGTH,
+            reinterpret_cast<PUCHAR>(&objectLength),
+            sizeof(objectLength),
+            &bytesReturned,
+            0
+        ))) {
+            break;
+        }
+
+        DWORD hashLength = 0;
+        if (!BCRYPT_SUCCESS(BCryptGetProperty(
+            algorithm,
+            BCRYPT_HASH_LENGTH,
+            reinterpret_cast<PUCHAR>(&hashLength),
+            sizeof(hashLength),
+            &bytesReturned,
+            0
+        ))) {
+            break;
+        }
+
+        if (objectLength == 0 || hashLength == 0) {
+            break;
+        }
+
+        hashObject.resize(objectLength);
+        digest.resize(hashLength);
+
+        if (!BCRYPT_SUCCESS(BCryptCreateHash(
+            algorithm,
+            &hash,
+            hashObject.data(),
+            static_cast<ULONG>(hashObject.size()),
+            nullptr,
+            0,
+            0
+        ))) {
+            break;
+        }
+
+        std::vector<unsigned char> buffer(64 * 1024);
+        DWORD bytesRead = 0;
+        bool readFailed = false;
+        for (;;) {
+            if (!ReadFile(file, buffer.data(), static_cast<DWORD>(buffer.size()), &bytesRead, nullptr)) {
+                readFailed = true;
+                break;
+            }
+
+            if (bytesRead == 0) break;
+
+            if (!BCRYPT_SUCCESS(BCryptHashData(
+                hash,
+                buffer.data(),
+                static_cast<ULONG>(bytesRead),
+                0
+            ))) {
+                readFailed = true;
+                break;
+            }
+        }
+
+        if (readFailed) {
+            break;
+        }
+
+        if (!BCRYPT_SUCCESS(BCryptFinishHash(
+            hash,
+            digest.data(),
+            static_cast<ULONG>(digest.size()),
+            0
+        ))) {
+            break;
+        }
+
+        sha256 = BytesToHexString(digest);
+        success = true;
+    } while (false);
+
+    if (hash) {
+        BCryptDestroyHash(hash);
+    }
+
+    if (algorithm) {
+        BCryptCloseAlgorithmProvider(algorithm, 0);
+    }
+
+    CloseHandle(file);
+    return success;
+}
+
+static std::wstring ReadStoredD2RHash() {
+    wchar_t value[128]{};
+    const std::wstring configPath = GetConfigPath();
+    GetPrivateProfileStringW(
+        L"Compatibility",
+        L"D2RExeSha256",
+        L"",
+        value,
+        ARRAYSIZE(value),
+        configPath.c_str()
+    );
+
+    return NormalizeHashText(value);
+}
+
+static void WriteStoredD2RHash(const std::wstring& hash) {
+    const std::wstring configPath = GetConfigPath();
+    WritePrivateProfileStringW(L"Compatibility", L"D2RExeSha256", hash.c_str(), configPath.c_str());
+    WritePrivateProfileStringW(nullptr, nullptr, nullptr, configPath.c_str());
+}
+
+static bool AcquireSingleInstanceLock() {
+    g_singleInstanceMutex = CreateMutexW(nullptr, TRUE, kSingleInstanceMutexName);
+    if (!g_singleInstanceMutex) {
+        MessageBoxW(
+            nullptr,
+            L"Unable to create the single-instance lock. The overlay will close.",
+            kAppTitle,
+            MB_ICONERROR | MB_OK
+        );
+        return false;
+    }
+
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        MessageBoxW(
+            nullptr,
+            L"D2R Damage Numbers is already running.",
+            kAppTitle,
+            MB_ICONINFORMATION | MB_OK
+        );
+        CloseHandle(g_singleInstanceMutex);
+        g_singleInstanceMutex = nullptr;
+        return false;
+    }
+
+    return true;
+}
+
+static void ReleaseSingleInstanceLock() {
+    if (!g_singleInstanceMutex) return;
+
+    ReleaseMutex(g_singleInstanceMutex);
+    CloseHandle(g_singleInstanceMutex);
+    g_singleInstanceMutex = nullptr;
+}
+
+static bool StartWatchingD2RProcess(DWORD processId) {
+    StopWatchingD2RProcess();
+
+    g_d2rProcessWatch = OpenProcess(SYNCHRONIZE, FALSE, processId);
+    if (!g_d2rProcessWatch) {
+        MessageBoxW(
+            nullptr,
+            L"D2R.exe is running, but the overlay could not watch it for shutdown. "
+            L"Start the overlay with the same permissions as Diablo II: Resurrected.",
+            kAppTitle,
+            MB_ICONERROR | MB_OK
+        );
+        return false;
+    }
+
+    if (WaitForSingleObject(g_d2rProcessWatch, 0) == WAIT_OBJECT_0) {
+        MessageBoxW(
+            nullptr,
+            L"D2R.exe closed before the overlay could start.",
+            kAppTitle,
+            MB_ICONERROR | MB_OK
+        );
+        StopWatchingD2RProcess();
+        return false;
+    }
+
+    return true;
+}
+
+static void StopWatchingD2RProcess() {
+    if (!g_d2rProcessWatch) return;
+
+    CloseHandle(g_d2rProcessWatch);
+    g_d2rProcessWatch = nullptr;
+}
+
+static bool CloseIfWatchedD2RProcessExited() {
+    if (!g_d2rProcessWatch) return false;
+    if (WaitForSingleObject(g_d2rProcessWatch, 0) != WAIT_OBJECT_0) return false;
+
+    if (g_overlayWnd && IsWindow(g_overlayWnd)) {
+        DestroyWindow(g_overlayWnd);
+    }
+    return true;
+}
+
+static void CheckD2RHashForLaunch(const std::wstring& processPath, std::wstring& currentHash) {
+    currentHash.clear();
+    if (!TryComputeFileSha256(processPath, currentHash)) {
+        return;
+    }
+
+    currentHash = NormalizeHashText(currentHash);
+    const std::wstring storedHash = ReadStoredD2RHash();
+
+    if (!IsSha256HexString(storedHash)) {
+        return;
+    }
+
+    if (_wcsicmp(storedHash.c_str(), currentHash.c_str()) != 0) {
+        std::wstring message =
+            L"D2R.exe has changed since the last validated launch.\n\n"
+            L"The overlay can still start, but the memory offsets may be outdated "
+            L"and damage numbers may not work until the signatures are updated.\n\n"
+            L"Previous SHA-256:\n";
+        message += storedHash;
+        message += L"\n\nCurrent SHA-256:\n";
+        message += currentHash;
+
+        MessageBoxW(nullptr, message.c_str(), kAppTitle, MB_ICONWARNING | MB_OK);
+    }
+}
+
+static bool ValidateOffsetsForLaunch(DWORD processId) {
+    std::wstring status;
+    if (ValidateD2RMemoryOffsets(processId, status)) {
+        return true;
+    }
+
+    std::wstring message =
+        L"D2R Damage Numbers could not find the required D2R memory offsets and will close.\n\n"
+        L"This usually means Diablo II: Resurrected updated and the memory signatures need maintenance.";
+
+    if (!status.empty()) {
+        message += L"\n\nScanner status:\n";
+        message += status;
+    }
+
+    MessageBoxW(nullptr, message.c_str(), kAppTitle, MB_ICONERROR | MB_OK);
+    return false;
 }
 
 static void AppendLogBlock(const std::wstring& text) {
@@ -690,6 +1022,10 @@ static void RunOverlayFrame(HWND hwnd) {
         g_smoothedFrameSeconds += (dt - g_smoothedFrameSeconds) * 0.08f;
     }
 
+    if (CloseIfWatchedD2RProcessExited()) {
+        return;
+    }
+
     UpdateOverlayPosition();
     const MemoryScannerFrameContext memoryContext = BuildMemoryScannerFrameContext();
     PollMemorySource(memoryContext, dt);
@@ -775,6 +1111,7 @@ static LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
         FrameTimer::Stop(hwnd);
         TrayController::RemoveTrayIcon(hwnd);
         CloseMemorySource();
+        StopWatchingD2RProcess();
         ReleaseOverlayRendererResources();
         FrameTimer::EndTimerResolution();
         PostQuitMessage(0);
@@ -786,12 +1123,46 @@ static LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARA
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
     const wchar_t CLASS_NAME[] = L"D2RDamageNumbersOverlay";
+    const bool scanMemory = HasCommandLineSwitch(L"--scan-memory");
 
     ConfigureMemoryScannerIntegration();
     LoadConfig();
 
-    if (HasCommandLineSwitch(L"--scan-memory")) {
+    if (scanMemory) {
         return RunMemoryScanOnce(FindD2RWindow(), g_config);
+    }
+
+    if (!AcquireSingleInstanceLock()) {
+        return 1;
+    }
+
+    D2RProcessInfo d2rProcess{};
+    if (!FindD2RProcess(d2rProcess)) {
+        MessageBoxW(
+            nullptr,
+            L"D2R.exe is not running. Start Diablo II: Resurrected first, then launch D2R Damage Numbers.",
+            kAppTitle,
+            MB_ICONERROR | MB_OK
+        );
+        ReleaseSingleInstanceLock();
+        return 2;
+    }
+
+    std::wstring currentD2RHash;
+    CheckD2RHashForLaunch(d2rProcess.processPath, currentD2RHash);
+
+    if (!ValidateOffsetsForLaunch(d2rProcess.processId)) {
+        ReleaseSingleInstanceLock();
+        return 3;
+    }
+
+    if (IsSha256HexString(currentD2RHash)) {
+        WriteStoredD2RHash(currentD2RHash);
+    }
+
+    if (!StartWatchingD2RProcess(d2rProcess.processId)) {
+        ReleaseSingleInstanceLock();
+        return 4;
     }
 
     AppendLogBlock(L"Overlay started");
@@ -820,7 +1191,9 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
     );
 
     if (!g_overlayWnd) {
-        MessageBoxW(nullptr, L"Failed to create overlay window.", L"Error", MB_ICONERROR);
+        MessageBoxW(nullptr, L"Failed to create overlay window.", kAppTitle, MB_ICONERROR | MB_OK);
+        StopWatchingD2RProcess();
+        ReleaseSingleInstanceLock();
         return 1;
     }
 
@@ -835,6 +1208,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
         DispatchMessageW(&msg);
     }
 
+    StopWatchingD2RProcess();
+    ReleaseSingleInstanceLock();
     return 0;
 }
 
